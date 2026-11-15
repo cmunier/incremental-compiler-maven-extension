@@ -1,0 +1,3 @@
+eu.munier.maven.incremental.plugin.IncrementalJavacCompiler
+eu.munier.maven.incremental.plugin.IncrementalCompileExecutionListener
+eu.munier.maven.incremental.state.ReactorAbiCache

@@ -1,0 +1,34 @@
+<component-set>
+    <components>
+        <component>
+            <role>org.codehaus.plexus.compiler.Compiler</role>
+            <role-hint>incremental-javac</role-hint>
+            <implementation>eu.munier.maven.incremental.plugin.IncrementalJavacCompiler</implementation>
+            <instantiation-strategy>singleton</instantiation-strategy>
+            <requirements>
+                <requirement>
+                    <role>eu.munier.maven.incremental.state.ReactorAbiCache</role>
+                    <field-name>reactorAbiCache</field-name>
+                </requirement>
+            </requirements>
+        </component>
+        <component>
+            <role>org.apache.maven.execution.MojoExecutionListener</role>
+            <role-hint>incremental-compile-listener</role-hint>
+            <implementation>eu.munier.maven.incremental.plugin.IncrementalCompileExecutionListener</implementation>
+            <instantiation-strategy>singleton</instantiation-strategy>
+            <requirements>
+                <requirement>
+                    <role>eu.munier.maven.incremental.state.ReactorAbiCache</role>
+                    <field-name>reactorAbiCache</field-name>
+                </requirement>
+            </requirements>
+        </component>
+        <component>
+            <role>eu.munier.maven.incremental.state.ReactorAbiCache</role>
+            <role-hint>default</role-hint>
+            <implementation>eu.munier.maven.incremental.state.ReactorAbiCache</implementation>
+            <instantiation-strategy>singleton</instantiation-strategy>
+        </component>
+    </components>
+</component-set>
