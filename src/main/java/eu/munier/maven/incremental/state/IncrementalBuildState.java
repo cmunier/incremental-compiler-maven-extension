@@ -20,7 +20,14 @@ import java.util.Set;
 public final class IncrementalBuildState {
 
     private static final int MAGIC = 0x494E4343; // "INCC"
-    private static final int SCHEMA_VERSION = 1;
+    private static final int SCHEMA_VERSION = 2;
+
+    /**
+     * Lightweight filesystem fingerprint of a compiled {@code .class} output file used to detect
+     * external tampering (such as Eclipse/m2e ECJ error-stub classes).
+     */
+    public record ClassFileFingerprint(long lastModifiedMillis, long fileSize) {
+    }
 
     private String optionsFingerprint;
     private final Map<String, SourceFileRecord> sourceRecords = new LinkedHashMap<>();
@@ -28,6 +35,9 @@ public final class IncrementalBuildState {
     private final Map<String, byte[]> externalClassCombinedHashes = new LinkedHashMap<>();
     private final Map<String, Long> classpathJarFingerprints = new LinkedHashMap<>();
     private final Set<String> pendingDirtySources = new LinkedHashSet<>();
+    private final Map<String, ClassFileFingerprint> classFileFingerprints = new LinkedHashMap<>();
+    private boolean hasAggregatingAptOutputs;
+    private final Set<String> aggregatingAptOutputPaths = new LinkedHashSet<>();
 
     public IncrementalBuildState(String optionsFingerprint) {
         this.optionsFingerprint = optionsFingerprint != null ? optionsFingerprint : "";
@@ -59,6 +69,22 @@ public final class IncrementalBuildState {
 
     public Set<String> getPendingDirtySources() {
         return pendingDirtySources;
+    }
+
+    public Map<String, ClassFileFingerprint> getClassFileFingerprints() {
+        return classFileFingerprints;
+    }
+
+    public boolean hasAggregatingAptOutputs() {
+        return hasAggregatingAptOutputs;
+    }
+
+    public void setHasAggregatingAptOutputs(boolean hasAggregatingAptOutputs) {
+        this.hasAggregatingAptOutputs = hasAggregatingAptOutputs;
+    }
+
+    public Set<String> getAggregatingAptOutputPaths() {
+        return aggregatingAptOutputPaths;
     }
 
     public Set<String> getAllExternalReferencedClasses() {
@@ -126,6 +152,19 @@ public final class IncrementalBuildState {
             for (String dirty : pendingDirtySources) {
                 out.writeUTF(dirty);
             }
+
+            out.writeInt(classFileFingerprints.size());
+            for (Map.Entry<String, ClassFileFingerprint> entry : classFileFingerprints.entrySet()) {
+                out.writeUTF(entry.getKey());
+                out.writeLong(entry.getValue().lastModifiedMillis());
+                out.writeLong(entry.getValue().fileSize());
+            }
+
+            out.writeBoolean(hasAggregatingAptOutputs);
+            out.writeInt(aggregatingAptOutputPaths.size());
+            for (String path : aggregatingAptOutputPaths) {
+                out.writeUTF(path);
+            }
         }
         Files.move(tmpFile, stateFile, StandardCopyOption.REPLACE_EXISTING);
     }
@@ -173,6 +212,20 @@ public final class IncrementalBuildState {
             int dirtyCount = in.readInt();
             for (int i = 0; i < dirtyCount; i++) {
                 state.pendingDirtySources.add(in.readUTF());
+            }
+
+            int classFpCount = in.readInt();
+            for (int i = 0; i < classFpCount; i++) {
+                String clsPath = in.readUTF();
+                long mtime = in.readLong();
+                long size = in.readLong();
+                state.classFileFingerprints.put(clsPath, new ClassFileFingerprint(mtime, size));
+            }
+
+            state.hasAggregatingAptOutputs = in.readBoolean();
+            int aggCount = in.readInt();
+            for (int i = 0; i < aggCount; i++) {
+                state.aggregatingAptOutputPaths.add(in.readUTF());
             }
 
             return state;

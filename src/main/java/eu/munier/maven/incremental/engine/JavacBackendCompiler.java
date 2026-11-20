@@ -26,22 +26,19 @@ import javax.tools.JavaCompiler;
 import javax.tools.JavaFileObject;
 import javax.tools.StandardJavaFileManager;
 import javax.tools.ToolProvider;
-import org.codehaus.plexus.compiler.CompilerConfiguration;
-import org.codehaus.plexus.compiler.CompilerException;
-import org.codehaus.plexus.compiler.CompilerMessage;
 
 /**
  * In-process JSR-199 {@link JavaCompiler} ({@code JavacTask}) backend that uses
  * {@link TrackingJavaFileManager} and {@link AstDependencyCollector} to record exact
- * class outputs, JSR-269 APT outputs, and compile-time AST dependencies.
+ * class outputs, JSR-269 APT outputs (both isolating and aggregating), and compile-time AST dependencies.
  */
 public final class JavacBackendCompiler implements BackendCompiler {
 
     @Override
     public RoundCompilationResult compileSubset(
-            CompilerConfiguration config,
+            CompileRequest config,
             Set<Path> sourcesToCompile,
-            Path outputDirectory) throws CompilerException {
+            Path outputDirectory) throws IncrementalCompilationException {
         if (sourcesToCompile.isEmpty()) {
             return new RoundCompilationResult(
                     true,
@@ -51,18 +48,21 @@ public final class JavacBackendCompiler implements BackendCompiler {
                     Collections.emptyMap(),
                     Collections.emptyMap(),
                     Collections.emptyMap(),
+                    Collections.emptySet(),
+                    false,
                     Collections.emptySet());
         }
 
         JavaCompiler systemCompiler = ToolProvider.getSystemJavaCompiler();
         if (systemCompiler == null) {
-            throw new CompilerException("No javax.tools.JavaCompiler available in current JVM runtime (JDK required).");
+            throw new IncrementalCompilationException(
+                    "No javax.tools.JavaCompiler available in current JVM runtime (JDK required).");
         }
 
         try {
             Files.createDirectories(outputDirectory);
         } catch (IOException e) {
-            throw new CompilerException("Failed to create output directory: " + outputDirectory, e);
+            throw new IncrementalCompilationException("Failed to create output directory: " + outputDirectory, e);
         }
 
         Charset encoding = resolveEncoding(config);
@@ -94,9 +94,9 @@ public final class JavacBackendCompiler implements BackendCompiler {
             Boolean taskSuccess = task.call();
             boolean success = Boolean.TRUE.equals(taskSuccess);
 
-            List<CompilerMessage> messages = toCompilerMessages(diagnosticCollector.getDiagnostics());
+            List<CompileDiagnostic> messages = toCompileDiagnostics(diagnosticCollector.getDiagnostics());
             if (!success && messages.isEmpty() && !compilerOutput.toString().isBlank()) {
-                messages.add(new CompilerMessage(compilerOutput.toString().trim(), CompilerMessage.Kind.ERROR));
+                messages.add(new CompileDiagnostic(compilerOutput.toString().trim(), CompileDiagnostic.Kind.ERROR));
             }
 
             Map<Path, Set<Path>> sourceToClassFiles = new LinkedHashMap<>();
@@ -139,13 +139,15 @@ public final class JavacBackendCompiler implements BackendCompiler {
                     sourceToAstRefs,
                     sourceToPkg,
                     sourceToWildcards,
-                    trackingFileManager.getAllGeneratedClassFiles());
+                    trackingFileManager.getAllGeneratedClassFiles(),
+                    trackingFileManager.isAggregatingAptDetected(),
+                    trackingFileManager.getAptGeneratedResourceFiles());
         } catch (IOException e) {
-            throw new CompilerException("I/O error during incremental javac compilation", e);
+            throw new IncrementalCompilationException("I/O error during incremental javac compilation", e);
         }
     }
 
-    public static List<String> buildJavacOptions(CompilerConfiguration config, Path outputDirectory)
+    public static List<String> buildJavacOptions(CompileRequest config, Path outputDirectory)
             throws IOException {
         List<String> options = new ArrayList<>();
 
@@ -261,8 +263,7 @@ public final class JavacBackendCompiler implements BackendCompiler {
 
         if (config.getCustomCompilerArgumentsEntries() != null) {
             var entries = new ArrayList<>(config.getCustomCompilerArgumentsEntries());
-            for (int i = 0; i < entries.size(); i++) {
-                Map.Entry<String, String> entry = entries.get(i);
+            for (Map.Entry<String, String> entry : entries) {
                 String key = entry.getKey();
                 String val = entry.getValue();
                 if (key == null || key.isBlank()) {
@@ -282,7 +283,7 @@ public final class JavacBackendCompiler implements BackendCompiler {
         return options;
     }
 
-    private static Charset resolveEncoding(CompilerConfiguration config) {
+    private static Charset resolveEncoding(CompileRequest config) {
         if (config.getSourceEncoding() != null && !config.getSourceEncoding().isBlank()) {
             try {
                 return Charset.forName(config.getSourceEncoding().trim());
@@ -293,9 +294,9 @@ public final class JavacBackendCompiler implements BackendCompiler {
         return StandardCharsets.UTF_8;
     }
 
-    private static List<CompilerMessage> toCompilerMessages(
+    private static List<CompileDiagnostic> toCompileDiagnostics(
             List<Diagnostic<? extends JavaFileObject>> diagnostics) {
-        List<CompilerMessage> result = new ArrayList<>(diagnostics.size());
+        List<CompileDiagnostic> result = new ArrayList<>(diagnostics.size());
         for (Diagnostic<? extends JavaFileObject> d : diagnostics) {
             String file = null;
             if (d.getSource() != null) {
@@ -307,14 +308,14 @@ public final class JavacBackendCompiler implements BackendCompiler {
             }
             int line = (int) Math.max(0, d.getLineNumber());
             int col = (int) Math.max(0, d.getColumnNumber());
-            CompilerMessage.Kind kind = switch (d.getKind()) {
-                case ERROR -> CompilerMessage.Kind.ERROR;
-                case WARNING -> CompilerMessage.Kind.WARNING;
-                case MANDATORY_WARNING -> CompilerMessage.Kind.MANDATORY_WARNING;
-                case NOTE -> CompilerMessage.Kind.NOTE;
-                default -> CompilerMessage.Kind.OTHER;
+            CompileDiagnostic.Kind kind = switch (d.getKind()) {
+                case ERROR -> CompileDiagnostic.Kind.ERROR;
+                case WARNING -> CompileDiagnostic.Kind.WARNING;
+                case MANDATORY_WARNING -> CompileDiagnostic.Kind.MANDATORY_WARNING;
+                case NOTE -> CompileDiagnostic.Kind.NOTE;
+                default -> CompileDiagnostic.Kind.OTHER;
             };
-            result.add(new CompilerMessage(
+            result.add(new CompileDiagnostic(
                     file,
                     kind,
                     line,

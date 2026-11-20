@@ -4,9 +4,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import org.codehaus.plexus.compiler.CompilerConfiguration;
-import org.codehaus.plexus.compiler.CompilerException;
-import org.codehaus.plexus.compiler.CompilerMessage;
 
 /**
  * SPI for invoking a compiler backend (such as JSR-199 {@code javac} or delegated Eclipse Tycho {@code jdt})
@@ -16,17 +13,19 @@ public interface BackendCompiler {
 
     record RoundCompilationResult(
             boolean success,
-            List<CompilerMessage> messages,
+            List<CompileDiagnostic> messages,
             Map<Path, Set<Path>> sourceToClassFiles,
             Map<Path, Set<Path>> sourceToAptGeneratedSources,
             Map<Path, Set<String>> sourceToAstReferencedClasses,
             Map<Path, String> sourceToPackageName,
             Map<Path, Set<String>> sourceToWildcardImports,
-            Set<Path> allGeneratedClassFiles) {
+            Set<Path> allGeneratedClassFiles,
+            boolean aggregatingAptDetected,
+            Set<Path> aptGeneratedResourceFiles) {
     }
 
     RoundCompilationResult compileSubset(
-            CompilerConfiguration baseConfig,
+            CompileRequest baseConfig,
             Set<Path> sourcesToCompile,
-            Path outputDirectory) throws CompilerException;
+            Path outputDirectory) throws IncrementalCompilationException;
 }

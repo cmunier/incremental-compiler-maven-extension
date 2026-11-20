@@ -28,16 +28,13 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import org.codehaus.plexus.compiler.CompilerConfiguration;
-import org.codehaus.plexus.compiler.CompilerException;
-import org.codehaus.plexus.compiler.CompilerMessage;
-import org.codehaus.plexus.compiler.CompilerResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Core class-level incremental compilation engine with two-tier ABI/Constant fingerprinting,
- * iterative dependent recompilation, JSR-269 APT output tracking, and multi-module reactor ABI caching.
+ * iterative dependent recompilation, JSR-269 APT output tracking (isolating and aggregating),
+ * output class integrity verification, and multi-module reactor ABI caching.
  */
 public final class IncrementalCompilationEngine {
 
@@ -48,7 +45,7 @@ public final class IncrementalCompilationEngine {
     private final ClassFileAnalyzer classFileAnalyzer = new ClassFileAnalyzer();
 
     public record CompilationExecutionReport(
-            CompilerResult compilerResult,
+            CompileOutcome compilerResult,
             boolean fullRebuild,
             int roundsExecuted,
             int totalSourcesCount,
@@ -77,18 +74,19 @@ public final class IncrementalCompilationEngine {
     }
 
     public CompilationExecutionReport compile(
-            CompilerConfiguration config,
-            BackendCompiler backendCompiler) throws CompilerException {
+            CompileRequest config,
+            BackendCompiler backendCompiler) throws IncrementalCompilationException {
         return compile(config, backendCompiler, null);
     }
 
     public CompilationExecutionReport compile(
-            CompilerConfiguration config,
+            CompileRequest config,
             BackendCompiler backendCompiler,
-            Path customStateFile) throws CompilerException {
+            Path customStateFile) throws IncrementalCompilationException {
         String outputLocation = config.getOutputLocation();
         if (outputLocation == null || outputLocation.isBlank()) {
-            throw new CompilerException("CompilerConfiguration outputLocation must not be null or empty.");
+            throw new IncrementalCompilationException(
+                    "CompileRequest outputLocation must not be null or empty.");
         }
         Path outputDirectory = Path.of(outputLocation).toAbsolutePath().normalize();
         Path stateFile = customStateFile != null
@@ -112,6 +110,7 @@ public final class IncrementalCompilationEngine {
                     currentSources,
                     optionsFingerprint,
                     normalizedClasspath,
+                    state,
                     fullRebuildReason);
         }
 
@@ -122,6 +121,7 @@ public final class IncrementalCompilationEngine {
                 stateFile,
                 state,
                 currentSources,
+                optionsFingerprint,
                 normalizedClasspath);
     }
 
@@ -139,21 +139,29 @@ public final class IncrementalCompilationEngine {
         if (!currentSources.isEmpty() && !Files.isDirectory(outputDirectory)) {
             return "output directory missing";
         }
+        if (state.hasAggregatingAptOutputs()
+                && !allFilesExist(state.getAggregatingAptOutputPaths())) {
+            return "aggregating annotation processor output missing";
+        }
         return null;
     }
 
     private CompilationExecutionReport executeFullRebuild(
-            CompilerConfiguration config,
+            CompileRequest config,
             BackendCompiler backendCompiler,
             Path outputDirectory,
             Path stateFile,
             Set<Path> currentSources,
             String optionsFingerprint,
             List<Path> normalizedClasspath,
-            String fullRebuildReason) throws CompilerException {
+            IncrementalBuildState previousState,
+            String fullRebuildReason) throws IncrementalCompilationException {
         Set<Path> deletedClasses = cleanDirectoryFiles(outputDirectory, ".class");
         if (config.getGeneratedSourcesDirectory() != null) {
             cleanDirectoryFiles(config.getGeneratedSourcesDirectory().toPath(), ".java");
+        }
+        if (previousState != null && !previousState.getAggregatingAptOutputPaths().isEmpty()) {
+            deleteRecordedFiles(previousState.getAggregatingAptOutputPaths());
         }
 
         int totalCount = currentSources.size();
@@ -164,7 +172,7 @@ public final class IncrementalCompilationEngine {
             LOG.info("[IncrementalCompiler] Full build ({}): 0 source files to compile in {}",
                     fullRebuildReason, outputDirectory);
             return new CompilationExecutionReport(
-                    new CompilerResult(true, Collections.emptyList()),
+                    CompileOutcome.ok(),
                     true,
                     0,
                     0,
@@ -182,9 +190,15 @@ public final class IncrementalCompilationEngine {
             for (Path src : currentSources) {
                 newState.getPendingDirtySources().add(src.toString());
             }
+            if (roundResult.aggregatingAptDetected() || !roundResult.aptGeneratedResourceFiles().isEmpty()) {
+                newState.setHasAggregatingAptOutputs(true);
+                for (Path p : roundResult.aptGeneratedResourceFiles()) {
+                    newState.getAggregatingAptOutputPaths().add(p.toAbsolutePath().normalize().toString());
+                }
+            }
             saveStateQuietly(newState, stateFile);
             return new CompilationExecutionReport(
-                    new CompilerResult(false, roundResult.messages()),
+                    new CompileOutcome(false, roundResult.messages()),
                     true,
                     1,
                     totalCount,
@@ -199,7 +213,7 @@ public final class IncrementalCompilationEngine {
         reactorAbiCache.updateModuleSummaries(outputDirectory, newState.getLocalClassSummaries());
 
         return new CompilationExecutionReport(
-                new CompilerResult(true, roundResult.messages()),
+                new CompileOutcome(true, roundResult.messages()),
                 true,
                 1,
                 totalCount,
@@ -208,13 +222,14 @@ public final class IncrementalCompilationEngine {
     }
 
     private CompilationExecutionReport executeIncrementalBuild(
-            CompilerConfiguration config,
+            CompileRequest config,
             BackendCompiler backendCompiler,
             Path outputDirectory,
             Path stateFile,
             IncrementalBuildState state,
             Set<Path> currentSources,
-            List<Path> normalizedClasspath) throws CompilerException {
+            String optionsFingerprint,
+            List<Path> normalizedClasspath) throws IncrementalCompilationException {
 
         DependencyGraph dependencyGraph = DependencyGraph.fromState(state);
         Set<Path> initialDirtySources = new LinkedHashSet<>();
@@ -223,6 +238,7 @@ public final class IncrementalCompilationEngine {
         Set<String> namespaceChangedPackages = new LinkedHashSet<>();
         Set<String> modifiedPackageInfoPackages = new LinkedHashSet<>();
         boolean stateMetadataModified = false;
+        boolean anySourceDeleted = false;
 
         Map<String, Path> currentSourceMap = new LinkedHashMap<>(currentSources.size());
         for (Path src : currentSources) {
@@ -236,6 +252,7 @@ public final class IncrementalCompilationEngine {
             String srcKey = entry.getKey();
             SourceFileRecord record = entry.getValue();
             if (!currentSourceMap.containsKey(srcKey)) {
+                anySourceDeleted = true;
                 stateMetadataModified = true;
                 deletedClassNames.addAll(record.getDefinedClassNames());
                 if (record.getPackageName() != null && !record.getPackageName().isEmpty()) {
@@ -247,13 +264,16 @@ public final class IncrementalCompilationEngine {
                 for (String definedCls : record.getDefinedClassNames()) {
                     state.getLocalClassSummaries().remove(definedCls);
                 }
+                for (String clsPath : record.getGeneratedClassFilePaths()) {
+                    state.getClassFileFingerprints().remove(clsPath);
+                }
                 deletedClassFiles.addAll(deleteRecordedFiles(record.getGeneratedClassFilePaths()));
                 deleteRecordedFiles(record.getAptGeneratedSourcePaths());
                 recordIterator.remove();
             }
         }
 
-        // 2. Detect added or modified .java files (and missing .class outputs)
+        // 2. Detect added, modified, or externally tampered-output .java files
         for (Map.Entry<String, Path> entry : currentSourceMap.entrySet()) {
             String srcKey = entry.getKey();
             Path srcPath = entry.getValue();
@@ -263,7 +283,7 @@ public final class IncrementalCompilationEngine {
                 continue;
             }
 
-            if (!allRecordedFilesExist(prevRecord.getGeneratedClassFilePaths())) {
+            if (!allRecordedClassOutputsIntact(prevRecord.getGeneratedClassFilePaths(), state)) {
                 initialDirtySources.add(srcPath);
                 continue;
             }
@@ -359,6 +379,21 @@ public final class IncrementalCompilationEngine {
             }
         }
 
+        // 5b. Aggregating annotation processors (e.g. Quarkus META-INF/quarkus-build-steps.list, AutoService)
+        // must see the complete module source set whenever any source is added, modified, or deleted.
+        if (state.hasAggregatingAptOutputs() && (!initialDirtySources.isEmpty() || anySourceDeleted)) {
+            return executeFullRebuild(
+                    config,
+                    backendCompiler,
+                    outputDirectory,
+                    stateFile,
+                    currentSources,
+                    optionsFingerprint,
+                    normalizedClasspath,
+                    state,
+                    "aggregating annotation processor outputs detected; source changes require full processor pass");
+        }
+
         int totalCount = currentSources.size();
 
         // 6. Fast exit if nothing needs recompilation
@@ -373,7 +408,7 @@ public final class IncrementalCompilationEngine {
             LOG.info("[IncrementalCompiler] Up-to-date: compiled 0 of {} source file(s) (0.0%), kept {} unchanged (100.0%) in {}",
                     totalCount, totalCount, outputDirectory);
             return new CompilationExecutionReport(
-                    new CompilerResult(true, Collections.emptyList()),
+                    CompileOutcome.ok(),
                     false,
                     0,
                     totalCount,
@@ -384,7 +419,7 @@ public final class IncrementalCompilationEngine {
         // 7. Iterative compilation rounds (Round 1: direct dirty set; Round 2+: ABI-affected dependents)
         Set<Path> roundSources = new LinkedHashSet<>(initialDirtySources);
         Set<Path> allCompiledSources = new LinkedHashSet<>();
-        List<CompilerMessage> allMessages = new ArrayList<>();
+        List<CompileDiagnostic> allMessages = new ArrayList<>();
         int round = 0;
 
         while (!roundSources.isEmpty() && round < MAX_INCREMENTAL_ROUNDS) {
@@ -407,6 +442,9 @@ public final class IncrementalCompilationEngine {
                 if (oldRecord != null) {
                     previousDefinedClassesPerSource.put(
                             src, new LinkedHashSet<>(oldRecord.getDefinedClassNames()));
+                    for (String clsPath : oldRecord.getGeneratedClassFilePaths()) {
+                        state.getClassFileFingerprints().remove(clsPath);
+                    }
                     deletedClassFiles.addAll(deleteRecordedFiles(oldRecord.getGeneratedClassFilePaths()));
                     deleteRecordedFiles(oldRecord.getAptGeneratedSourcePaths());
                 }
@@ -422,12 +460,32 @@ public final class IncrementalCompilationEngine {
                 LOG.warn("[IncrementalCompiler] Compilation failed in round {} after compiling {} of {} source file(s) in {}",
                         round, allCompiledSources.size(), totalCount, outputDirectory);
                 return new CompilationExecutionReport(
-                        new CompilerResult(false, allMessages),
+                        new CompileOutcome(false, allMessages),
                         false,
                         round,
                         totalCount,
                         allCompiledSources,
                         deletedClassFiles);
+            }
+
+            // If an aggregating APT appeared for the first time during a partial round (e.g. a newly added
+            // @BuildStep class in a previously non-aggregating module), promote immediately to a full rebuild
+            // so the generated resource reflects all classes in the module.
+            if (roundResult.aggregatingAptDetected() && allCompiledSources.size() < totalCount) {
+                state.setHasAggregatingAptOutputs(true);
+                for (Path p : roundResult.aptGeneratedResourceFiles()) {
+                    state.getAggregatingAptOutputPaths().add(p.toAbsolutePath().normalize().toString());
+                }
+                return executeFullRebuild(
+                        config,
+                        backendCompiler,
+                        outputDirectory,
+                        stateFile,
+                        currentSources,
+                        optionsFingerprint,
+                        normalizedClasspath,
+                        state,
+                        "new aggregating annotation processor output detected; promoting to full build");
             }
 
             Set<String> abiChangedClasses = new LinkedHashSet<>();
@@ -481,7 +539,7 @@ public final class IncrementalCompilationEngine {
                 outputDirectory);
 
         return new CompilationExecutionReport(
-                new CompilerResult(true, allMessages),
+                new CompileOutcome(true, allMessages),
                 false,
                 round,
                 totalCount,
@@ -507,7 +565,14 @@ public final class IncrementalCompilationEngine {
             Set<Path> compiledSources,
             BackendCompiler.RoundCompilationResult roundResult,
             Map<Path, Set<String>> previousDefinedClassesPerSource,
-            AbiDiffSink diffSink) throws CompilerException {
+            AbiDiffSink diffSink) throws IncrementalCompilationException {
+        if (roundResult.aggregatingAptDetected() || !roundResult.aptGeneratedResourceFiles().isEmpty()) {
+            state.setHasAggregatingAptOutputs(true);
+            for (Path resourcePath : roundResult.aptGeneratedResourceFiles()) {
+                state.getAggregatingAptOutputPaths().add(resourcePath.toAbsolutePath().normalize().toString());
+            }
+        }
+
         for (Path src : compiledSources) {
             Path normSrc = src.toAbsolutePath().normalize();
             String srcKey = normSrc.toString();
@@ -530,8 +595,16 @@ public final class IncrementalCompilationEngine {
                     continue;
                 }
                 Path normClassFile = classFile.toAbsolutePath().normalize();
-                classFilePathStrings.add(normClassFile.toString());
+                String normClassPathStr = normClassFile.toString();
+                classFilePathStrings.add(normClassPathStr);
                 try {
+                    BasicFileAttributes clsAttrs = Files.readAttributes(normClassFile, BasicFileAttributes.class);
+                    state.getClassFileFingerprints().put(
+                            normClassPathStr,
+                            new IncrementalBuildState.ClassFileFingerprint(
+                                    clsAttrs.lastModifiedTime().toMillis(),
+                                    clsAttrs.size()));
+
                     ClassFileSummary newSummary = classFileAnalyzer.analyze(normClassFile);
                     String binaryName = newSummary.getBinaryClassName();
                     newDefinedClassNames.add(binaryName);
@@ -554,7 +627,8 @@ public final class IncrementalCompilationEngine {
                         }
                     }
                 } catch (IOException e) {
-                    throw new CompilerException("Failed to analyze compiled class file: " + normClassFile, e);
+                    throw new IncrementalCompilationException(
+                            "Failed to analyze compiled class file: " + normClassFile, e);
                 }
             }
 
@@ -593,7 +667,7 @@ public final class IncrementalCompilationEngine {
                         astRefs);
                 state.getSourceRecords().put(srcKey, newRecord);
             } catch (IOException e) {
-                throw new CompilerException("Failed to read source file attributes: " + normSrc, e);
+                throw new IncrementalCompilationException("Failed to read source file attributes: " + normSrc, e);
             }
         }
     }
@@ -615,7 +689,7 @@ public final class IncrementalCompilationEngine {
         state.getClasspathJarFingerprints().putAll(updatedJarFingerprints);
     }
 
-    private static Set<Path> collectSourceFiles(CompilerConfiguration config) {
+    private static Set<Path> collectSourceFiles(CompileRequest config) {
         Set<Path> sources = new LinkedHashSet<>();
         if (config.getSourceFiles() != null && !config.getSourceFiles().isEmpty()) {
             for (File f : config.getSourceFiles()) {
@@ -650,7 +724,7 @@ public final class IncrementalCompilationEngine {
         return sources;
     }
 
-    private static List<Path> collectNormalizedClasspath(CompilerConfiguration config, Path outputDirectory) {
+    private static List<Path> collectNormalizedClasspath(CompileRequest config, Path outputDirectory) {
         List<Path> paths = new ArrayList<>();
         if (config.getClasspathEntries() != null) {
             for (String raw : config.getClasspathEntries()) {
@@ -671,7 +745,7 @@ public final class IncrementalCompilationEngine {
         return paths;
     }
 
-    public static String computeOptionsFingerprint(CompilerConfiguration config, Path outputDirectory) {
+    public static String computeOptionsFingerprint(CompileRequest config, Path outputDirectory) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-256");
             updateStr(md, "release=" + Objects.toString(config.getReleaseVersion(), ""));
@@ -740,12 +814,45 @@ public final class IncrementalCompilationEngine {
         return normOut.resolve(".incremental-state.bin");
     }
 
-    private static boolean allRecordedFilesExist(Set<String> filePaths) {
+    private static boolean allFilesExist(Set<String> filePaths) {
         if (filePaths == null || filePaths.isEmpty()) {
             return true;
         }
         for (String pathStr : filePaths) {
             if (!Files.isRegularFile(Path.of(pathStr))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Verifies that every recorded {@code .class} output still exists on disk and matches
+     * the exact {@code (lastModifiedMillis, fileSize)} written by our previous Maven build.
+     * Detects both missing outputs and externally overwritten {@code .class} files
+     * (such as Eclipse/m2e ECJ error stubs).
+     */
+    private static boolean allRecordedClassOutputsIntact(
+            Set<String> filePaths,
+            IncrementalBuildState state) {
+        if (filePaths == null || filePaths.isEmpty()) {
+            return true;
+        }
+        Map<String, IncrementalBuildState.ClassFileFingerprint> fingerprints = state.getClassFileFingerprints();
+        for (String pathStr : filePaths) {
+            Path p = Path.of(pathStr);
+            try {
+                BasicFileAttributes attrs = Files.readAttributes(p, BasicFileAttributes.class);
+                if (!attrs.isRegularFile()) {
+                    return false;
+                }
+                IncrementalBuildState.ClassFileFingerprint expected = fingerprints.get(pathStr);
+                if (expected == null
+                        || attrs.lastModifiedTime().toMillis() != expected.lastModifiedMillis()
+                        || attrs.size() != expected.fileSize()) {
+                    return false;
+                }
+            } catch (IOException e) {
                 return false;
             }
         }

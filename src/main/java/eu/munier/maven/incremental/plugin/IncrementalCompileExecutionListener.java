@@ -13,14 +13,13 @@ import org.apache.maven.plugin.Mojo;
 import org.apache.maven.plugin.MojoExecution;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.project.MavenProject;
-import org.codehaus.plexus.compiler.manager.CompilerManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
  * Maven 3.x {@link MojoExecutionListener} that transparently configures both
  * {@code maven-compiler-plugin} and {@code tycho-compiler-plugin} for class-level
- * incremental compilation.
+ * incremental compilation across isolated plugin ClassRealms (including {@code .mvn/extensions.xml}).
  */
 @Named("incremental-compile-listener")
 @Singleton
@@ -80,23 +79,19 @@ public class IncrementalCompileExecutionListener implements MojoExecutionListene
         // 1. Disable Maven's module-wiping useIncrementalCompilation so target/classes is preserved
         setBooleanFieldIfPresent(mojo, "useIncrementalCompilation", false);
 
-        // 2. For standard maven-compiler-plugin, switch default "javac" compilerId to "incremental-javac".
-        // For tycho-compiler-plugin, keep compilerId="jdt" so OSGi access rules stay enabled.
-        if (!isTychoCompiler) {
-            Object currentCompilerId = getFieldValue(mojo, "compilerId");
-            if (currentCompilerId == null || "javac".equals(currentCompilerId)) {
-                setFieldValue(mojo, "compilerId", IncrementalJavacCompiler.COMPILER_ID);
-            }
-        }
-
-        // 3. Wrap the Mojo's CompilerManager so both "javac" and Tycho's "jdt" are decorated
+        // 2. Keep compilerId as configured ("javac" for maven-compiler-plugin, "jdt" for tycho-compiler-plugin)
+        // and wrap the Mojo's CompilerManager via CrossRealmCompilerBridge against the plugin's own ClassLoader.
         Object existingManager = getFieldValue(mojo, "compilerManager");
-        if (existingManager instanceof CompilerManager cm
-                && !(existingManager instanceof IncrementalCompilerManagerDecorator)) {
-            setFieldValue(
-                    mojo,
-                    "compilerManager",
-                    new IncrementalCompilerManagerDecorator(cm, getReactorAbiCache()));
+        if (existingManager != null && !CrossRealmCompilerBridge.isAlreadyWrapped(existingManager)) {
+            ClassLoader pluginLoader = existingManager.getClass().getClassLoader();
+            if (pluginLoader == null) {
+                pluginLoader = mojo.getClass().getClassLoader();
+            }
+            Object wrappedManager = CrossRealmCompilerBridge.wrapCompilerManager(
+                    existingManager, pluginLoader, getReactorAbiCache());
+            if (wrappedManager != existingManager) {
+                setFieldValue(mojo, "compilerManager", wrappedManager);
+            }
         }
     }
 

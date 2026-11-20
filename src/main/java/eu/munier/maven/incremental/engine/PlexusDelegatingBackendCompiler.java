@@ -17,22 +17,30 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
-import org.codehaus.plexus.compiler.Compiler;
-import org.codehaus.plexus.compiler.CompilerConfiguration;
-import org.codehaus.plexus.compiler.CompilerException;
-import org.codehaus.plexus.compiler.CompilerResult;
 
 /**
- * {@link BackendCompiler} that delegates subset compilation to an existing Plexus {@link Compiler}
- * implementation (such as Eclipse Tycho's {@code JDTCompiler}), preserving OSGi access rules
- * and JDT-specific compiler arguments while adding class-level incremental compilation.
+ * {@link BackendCompiler} that delegates subset compilation to an external compiler
+ * (such as Eclipse Tycho's {@code JDTCompiler}) via a {@link SubsetCompilerDelegate},
+ * preserving OSGi access rules and JDT-specific compiler arguments while adding
+ * class-level incremental compilation.
  */
 public final class PlexusDelegatingBackendCompiler implements BackendCompiler {
 
-    private final Compiler delegate;
+    /**
+     * Functional delegate invoked for a subset of source files with an augmented classpath.
+     */
+    @FunctionalInterface
+    public interface SubsetCompilerDelegate {
+        CompileOutcome compile(Set<File> subsetSourceFiles, List<String> effectiveClasspath)
+                throws IncrementalCompilationException;
+    }
+
+    private final SubsetCompilerDelegate delegate;
     private final Set<String> knownConstantOwnerClasses;
 
-    public PlexusDelegatingBackendCompiler(Compiler delegate, Set<String> knownConstantOwnerClasses) {
+    public PlexusDelegatingBackendCompiler(
+            SubsetCompilerDelegate delegate,
+            Set<String> knownConstantOwnerClasses) {
         this.delegate = Objects.requireNonNull(delegate, "delegate");
         this.knownConstantOwnerClasses = knownConstantOwnerClasses != null
                 ? knownConstantOwnerClasses
@@ -41,9 +49,9 @@ public final class PlexusDelegatingBackendCompiler implements BackendCompiler {
 
     @Override
     public RoundCompilationResult compileSubset(
-            CompilerConfiguration baseConfig,
+            CompileRequest baseConfig,
             Set<Path> sourcesToCompile,
-            Path outputDirectory) throws CompilerException {
+            Path outputDirectory) throws IncrementalCompilationException {
         if (sourcesToCompile.isEmpty()) {
             return new RoundCompilationResult(
                     true,
@@ -53,13 +61,15 @@ public final class PlexusDelegatingBackendCompiler implements BackendCompiler {
                     Collections.emptyMap(),
                     Collections.emptyMap(),
                     Collections.emptyMap(),
+                    Collections.emptySet(),
+                    false,
                     Collections.emptySet());
         }
 
         try {
             Files.createDirectories(outputDirectory);
         } catch (IOException e) {
-            throw new CompilerException("Failed to create output directory: " + outputDirectory, e);
+            throw new IncrementalCompilationException("Failed to create output directory: " + outputDirectory, e);
         }
 
         Map<Path, Long> beforeClasses = snapshotFiles(outputDirectory, ".class");
@@ -70,100 +80,92 @@ public final class PlexusDelegatingBackendCompiler implements BackendCompiler {
                 ? snapshotFiles(genSrcDir, ".java")
                 : Collections.emptyMap();
 
-        Set<File> originalSources = baseConfig.getSourceFiles();
         List<String> originalClasspath = baseConfig.getClasspathEntries() != null
                 ? new ArrayList<>(baseConfig.getClasspathEntries())
                 : new ArrayList<>();
 
-        try {
-            Set<File> subsetFiles = new LinkedHashSet<>();
-            for (Path src : sourcesToCompile) {
-                subsetFiles.add(src.toAbsolutePath().normalize().toFile());
-            }
-            baseConfig.setSourceFiles(subsetFiles);
-
-            // Ensure outputDirectory is on classpath so JDT/ECJ resolves unchanged classes of the same bundle
-            String selfCpEntry = formatSelfClasspathEntry(outputDirectory, originalClasspath);
-            if (!containsOutputDirectory(originalClasspath, outputDirectory)) {
-                List<String> augmentedCp = new ArrayList<>(originalClasspath.size() + 1);
-                augmentedCp.add(selfCpEntry);
-                augmentedCp.addAll(originalClasspath);
-                baseConfig.setClasspathEntries(augmentedCp);
-            }
-
-            CompilerResult compilerResult = delegate.performCompile(baseConfig);
-            boolean success = compilerResult.isSuccess();
-
-            Set<Path> touchedClasses = findModifiedOrExpectedClasses(
-                    outputDirectory, beforeClasses, sourcesToCompile);
-            Set<Path> touchedAptSources = (genSrcDir != null && Files.isDirectory(genSrcDir))
-                    ? findModifiedFiles(genSrcDir, beforeAptSources, ".java")
-                    : Collections.emptySet();
-
-            Map<Path, Set<Path>> sourceToClassFiles = new LinkedHashMap<>();
-            Map<Path, Set<Path>> sourceToAptSources = new LinkedHashMap<>();
-            Map<Path, Set<String>> sourceToAstRefs = new LinkedHashMap<>();
-            Map<Path, String> sourceToPkg = new LinkedHashMap<>();
-            Map<Path, Set<String>> sourceToWildcards = new LinkedHashMap<>();
-
-            for (Path src : sourcesToCompile) {
-                Path normSrc = src.toAbsolutePath().normalize();
-                JavaSourceHeaderScanner.ScanResult scan = JavaSourceHeaderScanner.scan(normSrc);
-                String pkg = scan.packageName();
-                sourceToPkg.put(normSrc, pkg);
-                sourceToWildcards.put(normSrc, scan.wildcardImportedPackages());
-
-                Set<String> refs = new LinkedHashSet<>(scan.explicitImportedClasses());
-                // Match capitalized tokens against known constant-bearing classes
-                for (String token : scan.capitalizedTokens()) {
-                    for (String constOwner : knownConstantOwnerClasses) {
-                        if (constOwner.endsWith("." + token) || constOwner.equals(token)) {
-                            refs.add(constOwner);
-                        }
-                    }
-                }
-                sourceToAstRefs.put(normSrc, refs);
-
-                String simpleSourceName = stripExtension(normSrc.getFileName().toString());
-                String sourceFileName = normSrc.getFileName().toString();
-                String relPkgDir = pkg.isEmpty() ? "" : pkg.replace('.', File.separatorChar);
-                Path expectedPkgDir = relPkgDir.isEmpty()
-                        ? outputDirectory.toAbsolutePath().normalize()
-                        : outputDirectory.toAbsolutePath().normalize().resolve(relPkgDir);
-
-                Set<Path> matchedClasses = new LinkedHashSet<>();
-                for (Path clsFile : touchedClasses) {
-                    if (clsFile.getParent() != null && clsFile.getParent().equals(expectedPkgDir)) {
-                        String clsFileName = clsFile.getFileName().toString();
-                        if (clsFileName.equals(simpleSourceName + ".class")
-                                || clsFileName.startsWith(simpleSourceName + "$")
-                                || sourcesToCompile.size() == 1
-                                || matchesBytecodeSourceFileAttribute(clsFile, sourceFileName)) {
-                            matchedClasses.add(clsFile);
-                        }
-                    }
-                }
-                sourceToClassFiles.put(normSrc, matchedClasses);
-                sourceToAptSources.put(normSrc, sourcesToCompile.size() == 1
-                        ? new LinkedHashSet<>(touchedAptSources)
-                        : Collections.emptySet());
-            }
-
-            return new RoundCompilationResult(
-                    success,
-                    compilerResult.getCompilerMessages() != null
-                            ? compilerResult.getCompilerMessages()
-                            : Collections.emptyList(),
-                    sourceToClassFiles,
-                    sourceToAptSources,
-                    sourceToAstRefs,
-                    sourceToPkg,
-                    sourceToWildcards,
-                    touchedClasses);
-        } finally {
-            baseConfig.setSourceFiles(originalSources);
-            baseConfig.setClasspathEntries(originalClasspath);
+        Set<File> subsetFiles = new LinkedHashSet<>();
+        for (Path src : sourcesToCompile) {
+            subsetFiles.add(src.toAbsolutePath().normalize().toFile());
         }
+
+        // Ensure outputDirectory is on classpath so JDT/ECJ resolves unchanged classes of the same bundle
+        List<String> effectiveClasspath = originalClasspath;
+        if (!containsOutputDirectory(originalClasspath, outputDirectory)) {
+            effectiveClasspath = new ArrayList<>(originalClasspath.size() + 1);
+            effectiveClasspath.add(formatSelfClasspathEntry(outputDirectory, originalClasspath));
+            effectiveClasspath.addAll(originalClasspath);
+        }
+
+        CompileOutcome outcome = delegate.compile(subsetFiles, effectiveClasspath);
+        boolean success = outcome.success();
+
+        Set<Path> touchedClasses = findModifiedOrExpectedClasses(
+                outputDirectory, beforeClasses, sourcesToCompile);
+        Set<Path> touchedAptSources = (genSrcDir != null && Files.isDirectory(genSrcDir))
+                ? findModifiedFiles(genSrcDir, beforeAptSources, ".java")
+                : Collections.emptySet();
+
+        Map<Path, Set<Path>> sourceToClassFiles = new LinkedHashMap<>();
+        Map<Path, Set<Path>> sourceToAptSources = new LinkedHashMap<>();
+        Map<Path, Set<String>> sourceToAstRefs = new LinkedHashMap<>();
+        Map<Path, String> sourceToPkg = new LinkedHashMap<>();
+        Map<Path, Set<String>> sourceToWildcards = new LinkedHashMap<>();
+
+        for (Path src : sourcesToCompile) {
+            Path normSrc = src.toAbsolutePath().normalize();
+            JavaSourceHeaderScanner.ScanResult scan = JavaSourceHeaderScanner.scan(normSrc);
+            String pkg = scan.packageName();
+            sourceToPkg.put(normSrc, pkg);
+            sourceToWildcards.put(normSrc, scan.wildcardImportedPackages());
+
+            Set<String> refs = new LinkedHashSet<>(scan.explicitImportedClasses());
+            // Match capitalized tokens against known constant-bearing classes
+            for (String token : scan.capitalizedTokens()) {
+                for (String constOwner : knownConstantOwnerClasses) {
+                    if (constOwner.endsWith("." + token) || constOwner.equals(token)) {
+                        refs.add(constOwner);
+                    }
+                }
+            }
+            sourceToAstRefs.put(normSrc, refs);
+
+            String simpleSourceName = stripExtension(normSrc.getFileName().toString());
+            String sourceFileName = normSrc.getFileName().toString();
+            String relPkgDir = pkg.isEmpty() ? "" : pkg.replace('.', File.separatorChar);
+            Path expectedPkgDir = relPkgDir.isEmpty()
+                    ? outputDirectory.toAbsolutePath().normalize()
+                    : outputDirectory.toAbsolutePath().normalize().resolve(relPkgDir);
+
+            Set<Path> matchedClasses = new LinkedHashSet<>();
+            for (Path clsFile : touchedClasses) {
+                if (clsFile.getParent() != null && clsFile.getParent().equals(expectedPkgDir)) {
+                    String clsFileName = clsFile.getFileName().toString();
+                    if (clsFileName.equals(simpleSourceName + ".class")
+                            || clsFileName.startsWith(simpleSourceName + "$")
+                            || sourcesToCompile.size() == 1
+                            || matchesBytecodeSourceFileAttribute(clsFile, sourceFileName)) {
+                        matchedClasses.add(clsFile);
+                    }
+                }
+            }
+            sourceToClassFiles.put(normSrc, matchedClasses);
+            sourceToAptSources.put(normSrc, sourcesToCompile.size() == 1
+                    ? new LinkedHashSet<>(touchedAptSources)
+                    : Collections.emptySet());
+        }
+
+        return new RoundCompilationResult(
+                success,
+                outcome.messages(),
+                sourceToClassFiles,
+                sourceToAptSources,
+                sourceToAstRefs,
+                sourceToPkg,
+                sourceToWildcards,
+                touchedClasses,
+                false,
+                Collections.emptySet());
     }
 
     private static String formatSelfClasspathEntry(Path outputDirectory, List<String> existingEntries) {

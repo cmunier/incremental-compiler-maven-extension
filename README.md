@@ -36,17 +36,18 @@ Out of the box, `maven-compiler-plugin` only supports **module-level** increment
    - **`package-info.java` handling (JLS §7.4.1)**: Avoids redundant recompilation when `package-info.java` produces no `.class` output (source-only annotations or documentation) while recompiling package members when `package-info.java` changes.
    - **Java 17+ `record` & `sealed` hierarchies (JLS §8.1.1.2)**: Tracks `RecordComponent` and `PermittedSubclasses` attributes so exhaustive `switch` expressions and subtypes are revalidated when `permits` clauses change.
 
-4. **Incremental JSR-269 annotation processing (APT)**
-   - Wraps the compiler's `StandardJavaFileManager` with a `TrackingJavaFileManager` to record exact provenance between originating `.java` sources, APT-generated `.java` sources (e.g., MapStruct, Immutables), and their compiled `.class` files.
-   - Automatically deletes stale generated `.java` and `.class` files before recompiling modified originating sources or when sources are removed.
+4. **Incremental JSR-269 annotation processing (Isolating & Aggregating APT)**
+   - Wraps the compiler's `StandardJavaFileManager` with a `TrackingJavaFileManager` to record exact provenance between originating `.java` sources, isolating APT-generated `.java` sources (e.g., MapStruct, Immutables), and their compiled `.class` files.
+   - Detects **aggregating annotation processors** (e.g., Quarkus `META-INF/quarkus-build-steps.list`, `AutoService` `META-INF/services/*`, or unattributed APT outputs): no-op builds stay at 0 recompiles, while any source addition, modification, or deletion in an aggregating module cleans up stale generated resources and triggers a consistent full module pass.
 
 5. **Seamless support for `maven-compiler-plugin` and `tycho-compiler-plugin`**
-   - Works in pure Maven builds, pure Eclipse Tycho / OSGi builds, and mixed Maven + Tycho multi-module reactors.
-   - Preserves Tycho's `JDTCompiler` (`compilerId="jdt"`), OSGi access rules (`bundle.jar[+org/example/api/*;?**/*]`), and `.settings/org.eclipse.jdt.core.prefs` via `IncrementalDelegatingCompiler`.
+   - Works in pure Maven builds, pure Eclipse Tycho / OSGi builds, and mixed Maven + Tycho multi-module reactors via a ClassRealm-agnostic `CrossRealmCompilerBridge`.
+   - Preserves Tycho's `JDTCompiler` (`compilerId="jdt"`), OSGi access rules (`bundle.jar[+org/example/api/*;?**/*]`), and `.settings/org.eclipse.jdt.core.prefs`.
    - Shares class ABI snapshots across all modules in the reactor through a `@Singleton` `ReactorAbiCache`.
 
-6. **Crash-safe state persistence & automatic full rebuild detection**
+6. **Crash-safe state persistence, external output integrity & automatic full rebuild detection**
    - Persists incremental state atomically in `target/incremental-compiler/classes/state.bin` (and `test-classes/state.bin`).
+   - Records `(lastModifiedTime, fileSize)` fingerprints of every compiled `.class` output and automatically recompiles sources if an external tool (such as Eclipse/m2e ECJ writing error-stub classes) modified or replaced `.class` files in `target/classes`.
    - Records `pendingDirtySources` *before* each compilation round: if a build fails due to a compile error in a dependent class, the next build will reliably re-attempt compilation even if no files were edited in between.
    - Automatically triggers a clean full module rebuild whenever compiler flags (`--release`, `-source`, `-target`, `-encoding`, `-parameters`, `-g`, `-proc`, custom compiler args) or OSGi descriptors (`META-INF/MANIFEST.MF`, `build.properties`, `.settings/org.eclipse.jdt.core.prefs`) change.
 
@@ -86,7 +87,7 @@ With this in place, `IncrementalCompileExecutionListener` automatically intercep
 ```xml
 <build>
   <plugins>
-    <!-- Standard Maven modules -->
+    <!-- Registers the listener for BOTH maven-compiler-plugin AND tycho-compiler-plugin -->
     <plugin>
       <groupId>org.apache.maven.plugins</groupId>
       <artifactId>maven-compiler-plugin</artifactId>
@@ -100,24 +101,11 @@ With this in place, `IncrementalCompileExecutionListener` automatically intercep
         </dependency>
       </dependencies>
     </plugin>
-
-    <!-- Optional: If Eclipse Tycho is also used in the reactor -->
-    <plugin>
-      <groupId>org.eclipse.tycho</groupId>
-      <artifactId>tycho-compiler-plugin</artifactId>
-      <version>${tycho.version}</version>
-      <extensions>true</extensions>
-      <dependencies>
-        <dependency>
-          <groupId>eu.munier.maven.extensions</groupId>
-          <artifactId>incremental-compiler-maven-extension</artifactId>
-          <version>1.0.0-SNAPSHOT</version>
-        </dependency>
-      </dependencies>
-    </plugin>
   </plugins>
 </build>
 ```
+
+> **Note for Eclipse Tycho projects:** Do **not** add `<extensions>true</extensions>` to `tycho-compiler-plugin` (this conflicts with Tycho's own `tycho-maven-plugin` p2 lifecycle extension). Either Option 1 (`.mvn/extensions.xml`) or Option 2 (`maven-compiler-plugin` with `<extensions>true</extensions>`) automatically intercepts `tycho-compiler-plugin` across ClassRealms with no additional Tycho plugin dependency required.
 
 ---
 

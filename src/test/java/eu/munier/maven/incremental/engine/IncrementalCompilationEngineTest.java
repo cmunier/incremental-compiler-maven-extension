@@ -2,10 +2,10 @@ package eu.munier.maven.incremental.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import eu.munier.maven.incremental.bytecode.ClassFileAnalyzer;
+import eu.munier.maven.incremental.bytecode.ClassFileSummary;
+import eu.munier.maven.incremental.plugin.CrossRealmCompilerBridge;
 import eu.munier.maven.incremental.plugin.IncrementalCompileExecutionListener;
-import eu.munier.maven.incremental.plugin.IncrementalCompilerManagerDecorator;
-import eu.munier.maven.incremental.plugin.IncrementalDelegatingCompiler;
-import eu.munier.maven.incremental.plugin.IncrementalJavacCompiler;
 import eu.munier.maven.incremental.state.ClasspathEntryNormalizer;
 import eu.munier.maven.incremental.state.ReactorAbiCache;
 import java.io.File;
@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.TreeSet;
 import javax.annotation.processing.AbstractProcessor;
 import javax.annotation.processing.RoundEnvironment;
 import javax.annotation.processing.SupportedAnnotationTypes;
@@ -30,7 +31,9 @@ import javax.annotation.processing.SupportedSourceVersion;
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.Element;
 import javax.lang.model.element.TypeElement;
+import javax.tools.FileObject;
 import javax.tools.JavaFileObject;
+import javax.tools.StandardLocation;
 import org.apache.maven.plugin.AbstractMojo;
 import org.codehaus.plexus.compiler.Compiler;
 import org.codehaus.plexus.compiler.CompilerConfiguration;
@@ -70,7 +73,7 @@ class IncrementalCompilationEngineTest {
         CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(fileA, fileB));
 
         // 1. Initial full build
-        var r1 = engine.compile(cfg, backend);
+        var r1 = runCompile(engine, cfg, backend);
         assertThat(r1.compilerResult().isSuccess()).isTrue();
         assertThat(r1.fullRebuild()).isTrue();
         assertThat(r1.totalSourcesCount()).isEqualTo(2);
@@ -81,7 +84,7 @@ class IncrementalCompilationEngineTest {
         assertThat(r1.compiledSources()).containsExactlyInAnyOrder(fileA, fileB);
 
         // 2. Immediate second build -> 0 files compiled
-        var r2 = engine.compile(cfg, backend);
+        var r2 = runCompile(engine, cfg, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         assertThat(r2.fullRebuild()).isFalse();
         assertThat(r2.roundsExecuted()).isZero();
@@ -94,7 +97,7 @@ class IncrementalCompilationEngineTest {
 
         // 3. Touch fileA (advance timestamp by +10s without changing content) -> 0 files compiled
         Files.setLastModifiedTime(fileA, FileTime.from(Instant.now().plusSeconds(10)));
-        var r3 = engine.compile(cfg, backend);
+        var r3 = runCompile(engine, cfg, backend);
         assertThat(r3.compilerResult().isSuccess()).isTrue();
         assertThat(r3.roundsExecuted()).isZero();
         assertThat(r3.compiledSources()).isEmpty();
@@ -138,7 +141,7 @@ class IncrementalCompilationEngineTest {
                 """);
 
         CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(fileA, fileB, fileC));
-        var r1 = engine.compile(cfg, backend);
+        var r1 = runCompile(engine, cfg, backend);
         assertThat(r1.compilerResult().isSuccess()).isTrue();
         assertThat(r1.compiledSources()).hasSize(3);
 
@@ -155,7 +158,7 @@ class IncrementalCompilationEngineTest {
                 }
                 """);
 
-        var r2 = engine.compile(cfg, backend);
+        var r2 = runCompile(engine, cfg, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         assertThat(r2.fullRebuild()).isFalse();
         assertThat(r2.roundsExecuted()).isEqualTo(1);
@@ -208,7 +211,7 @@ class IncrementalCompilationEngineTest {
                 """);
 
         CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(fileA, fileB, fileC, fileUnrelated));
-        assertThat(engine.compile(cfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, cfg, backend).compilerResult().isSuccess()).isTrue();
 
         // Change RepoA.fetchCount() return type from int to long (ABI change!)
         // FacadeB calls repo.fetchCount() in string concatenation, so FacadeB still compiles and its own ABI (String summary()) stays unchanged!
@@ -219,7 +222,7 @@ class IncrementalCompilationEngineTest {
                 }
                 """);
 
-        var r2 = engine.compile(cfg, backend);
+        var r2 = runCompile(engine, cfg, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         assertThat(r2.roundsExecuted()).isEqualTo(2);
         // Round 1 compiled RepoA, detected ABI change; Round 2 compiled FacadeB, saw FacadeB's ABI was unchanged,
@@ -254,7 +257,7 @@ class IncrementalCompilationEngineTest {
                 """);
 
         CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(constantsFile, consumerFile));
-        assertThat(engine.compile(cfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, cfg, backend).compilerResult().isSuccess()).isTrue();
         assertThat(invokeDescribe(outDir, "com.example.ConstantConsumer")).isEqualTo("v1#25");
 
         // Update the compile-time constants in AppConstants.java
@@ -266,7 +269,7 @@ class IncrementalCompilationEngineTest {
                 }
                 """);
 
-        var r2 = engine.compile(cfg, backend);
+        var r2 = runCompile(engine, cfg, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         // ConstantConsumer MUST be recompiled even though javac inlines constants and omits AppConstants from ConstantConsumer's bytecode Constant Pool!
         assertThat(r2.compiledSources()).containsExactlyInAnyOrder(constantsFile, consumerFile);
@@ -297,7 +300,7 @@ class IncrementalCompilationEngineTest {
                 """);
 
         CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(outerFile, obsoleteFile));
-        assertThat(engine.compile(cfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, cfg, backend).compilerResult().isSuccess()).isTrue();
         assertThat(outDir.resolve("com/example/Outer.class")).exists();
         assertThat(outDir.resolve("com/example/Outer$NestedHelper.class")).exists();
         assertThat(outDir.resolve("com/example/Obsolete.class")).exists();
@@ -311,7 +314,7 @@ class IncrementalCompilationEngineTest {
         Files.delete(obsoleteFile);
 
         CompilerConfiguration cfg2 = createConfig(srcDir, outDir, List.of(outerFile));
-        var r2 = engine.compile(cfg2, backend);
+        var r2 = runCompile(engine, cfg2, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         assertThat(outDir.resolve("com/example/Outer.class")).exists();
         assertThat(outDir.resolve("com/example/Outer$NestedHelper.class")).doesNotExist();
@@ -342,7 +345,7 @@ class IncrementalCompilationEngineTest {
                 """);
 
         CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(providerFile, callerFile));
-        assertThat(engine.compile(cfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, cfg, backend).compilerResult().isSuccess()).isTrue();
 
         // Break Provider's signature so Provider compiles in Round 1, but Caller fails in Round 2
         writeJava(srcDir, "com/example/Provider.java", """
@@ -354,12 +357,12 @@ class IncrementalCompilationEngineTest {
                 }
                 """);
 
-        var failedRun1 = engine.compile(cfg, backend);
+        var failedRun1 = runCompile(engine, cfg, backend);
         assertThat(failedRun1.compilerResult().isSuccess()).isFalse();
         assertThat(failedRun1.compiledSources()).containsExactlyInAnyOrder(providerFile, callerFile);
 
         // Run build AGAIN without modifying any file -> must NOT report "up-to-date"; Caller is still dirty & broken!
-        var failedRun2 = engine.compile(cfg, backend);
+        var failedRun2 = runCompile(engine, cfg, backend);
         assertThat(failedRun2.compilerResult().isSuccess()).isFalse();
         assertThat(failedRun2.compiledSources()).containsExactly(callerFile);
 
@@ -371,7 +374,7 @@ class IncrementalCompilationEngineTest {
                 }
                 """);
 
-        var fixedRun = engine.compile(cfg, backend);
+        var fixedRun = runCompile(engine, cfg, backend);
         assertThat(fixedRun.compilerResult().isSuccess()).isTrue();
         assertThat(fixedRun.compiledSources()).containsExactly(callerFile);
     }
@@ -419,8 +422,8 @@ class IncrementalCompilationEngineTest {
         webCfg.setClasspathEntries(List.of(coreOut.toString()));
 
         // 1. Initial build of both modules
-        assertThat(engine.compile(coreCfg, backend).compilerResult().isSuccess()).isTrue();
-        assertThat(engine.compile(webCfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, coreCfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, webCfg, backend).compilerResult().isSuccess()).isTrue();
 
         // 2. Internal implementation change in module-core (ABI unchanged)
         writeJava(coreSrc, "com/core/UserApi.java", """
@@ -435,11 +438,11 @@ class IncrementalCompilationEngineTest {
                 }
                 """);
 
-        var coreInternalRebuild = engine.compile(coreCfg, backend);
+        var coreInternalRebuild = runCompile(engine, coreCfg, backend);
         assertThat(coreInternalRebuild.compiledSources()).containsExactly(coreApiFile);
 
         // Downstream module-web sees that UserApi's ABI hash in module-core is unchanged -> compiles 0 files!
-        var webAfterInternalChange = engine.compile(webCfg, backend);
+        var webAfterInternalChange = runCompile(engine, webCfg, backend);
         assertThat(webAfterInternalChange.compilerResult().isSuccess()).isTrue();
         assertThat(webAfterInternalChange.compiledSources()).isEmpty();
 
@@ -454,10 +457,10 @@ class IncrementalCompilationEngineTest {
                 }
                 """);
 
-        assertThat(engine.compile(coreCfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, coreCfg, backend).compilerResult().isSuccess()).isTrue();
 
         // Downstream module-web recompiles ONLY UserEndpoint.java (HealthCheck.java is untouched!)
-        var webAfterAbiChange = engine.compile(webCfg, backend);
+        var webAfterAbiChange = runCompile(engine, webCfg, backend);
         assertThat(webAfterAbiChange.compilerResult().isSuccess()).isTrue();
         assertThat(webAfterAbiChange.compiledSources()).containsExactly(webEndpointFile);
     }
@@ -502,7 +505,7 @@ class IncrementalCompilationEngineTest {
         cfg.setAnnotationProcessors(new String[] { TestBuilderAnnotationProcessor.class.getName() });
 
         // 1. Initial compile runs the JSR-269 processor and generates CustomerBuilder.java + CustomerBuilder.class
-        var r1 = engine.compile(cfg, backend);
+        var r1 = runCompile(engine, cfg, backend);
         assertThat(r1.compilerResult().isSuccess()).isTrue();
         assertThat(genDir.resolve("com/example/CustomerBuilder.java")).exists();
         assertThat(outDir.resolve("com/example/CustomerBuilder.class")).exists();
@@ -516,7 +519,7 @@ class IncrementalCompilationEngineTest {
                 }
                 """);
 
-        var r2 = engine.compile(cfg, backend);
+        var r2 = runCompile(engine, cfg, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         assertThat(r2.compiledSources()).containsExactly(modelFile);
         // Old APT output CustomerBuilder (.java & .class) was cleaned up and new CustomerFactory was generated!
@@ -544,31 +547,33 @@ class IncrementalCompilationEngineTest {
                 .isEqualTo(bundleJar.toAbsolutePath().normalize());
 
         // Verify IncrementalCompileExecutionListener preserves compilerId="jdt" on Tycho Mojos
-        // while wrapping CompilerManager with IncrementalCompilerManagerDecorator
+        // while wrapping CompilerManager via CrossRealmCompilerBridge
         DummyTychoMojo tychoMojo = new DummyTychoMojo();
         IncrementalCompileExecutionListener listener = new IncrementalCompileExecutionListener(cache);
         listener.configureMojoForIncrementalCompile(tychoMojo, true);
 
         assertThat(tychoMojo.compilerId).isEqualTo("jdt");
         assertThat(tychoMojo.useIncrementalCompilation).isFalse();
-        assertThat(tychoMojo.compilerManager).isInstanceOf(IncrementalCompilerManagerDecorator.class);
+        assertThat(CrossRealmCompilerBridge.isAlreadyWrapped(tychoMojo.compilerManager)).isTrue();
 
-        // Also verify standard maven-compiler-plugin configuration switches "javac" to "incremental-javac"
+        // Also verify standard maven-compiler-plugin keeps compilerId="javac" and intercepts via proxy
         DummyTychoMojo mavenMojo = new DummyTychoMojo();
         mavenMojo.compilerId = "javac";
         listener.configureMojoForIncrementalCompile(mavenMojo, false);
-        assertThat(mavenMojo.compilerId).isEqualTo(IncrementalJavacCompiler.COMPILER_ID);
-        Compiler incJavac = mavenMojo.compilerManager.getCompiler(IncrementalJavacCompiler.COMPILER_ID);
-        assertThat(incJavac).isInstanceOf(IncrementalJavacCompiler.class);
+        assertThat(mavenMojo.compilerId).isEqualTo("javac");
+        assertThat(CrossRealmCompilerBridge.isAlreadyWrapped(mavenMojo.compilerManager)).isTrue();
+        Compiler incJavac = mavenMojo.compilerManager.getCompiler("javac");
         assertThat(incJavac.canUpdateTarget(new CompilerConfiguration())).isTrue();
+        assertThat(incJavac.getOutputFileEnding(new CompilerConfiguration()))
+                .isEqualTo(CrossRealmCompilerBridge.INCREMENTAL_MARKER_SUFFIX);
         assertThat(incJavac.createCommandLine(new CompilerConfiguration())).contains("-sourcepath");
 
         Compiler resolvedCompiler = tychoMojo.compilerManager.getCompiler("jdt");
-        assertThat(resolvedCompiler).isInstanceOf(IncrementalDelegatingCompiler.class);
+        assertThat(resolvedCompiler.canUpdateTarget(new CompilerConfiguration())).isTrue();
         assertThat(resolvedCompiler.getOutputFileEnding(new CompilerConfiguration()))
-                .isEqualTo(IncrementalJavacCompiler.INCREMENTAL_MARKER_SUFFIX);
+                .isEqualTo(CrossRealmCompilerBridge.INCREMENTAL_MARKER_SUFFIX);
 
-        // Execute incremental build through the decorated Tycho compiler (with OSGi MANIFEST.MF)
+        // Execute incremental build through the proxied Tycho compiler (with OSGi MANIFEST.MF)
         Path bundleDir = tempDir.resolve("tycho-bundle");
         Path manifestFile = bundleDir.resolve("META-INF/MANIFEST.MF");
         Files.createDirectories(manifestFile.getParent());
@@ -592,10 +597,8 @@ class IncrementalCompilationEngineTest {
         CompilerConfiguration tychoCfg = createConfig(srcDir, outDir, List.of(activatorFile, serviceFile));
         tychoCfg.setClasspathEntries(List.of(tychoCpEntry));
 
-        IncrementalDelegatingCompiler delegatingCompiler = (IncrementalDelegatingCompiler) resolvedCompiler;
-        assertThat(delegatingCompiler.performCompile(tychoCfg).isSuccess()).isTrue();
-        assertThat(delegatingCompiler.getLastReport().compiledSources())
-                .containsExactlyInAnyOrder(activatorFile, serviceFile);
+        assertThat(resolvedCompiler.performCompile(tychoCfg).isSuccess()).isTrue();
+        assertThat(tychoMojo.lastCompiledSubset).containsExactlyInAnyOrder(activatorFile, serviceFile);
 
         // Private body change in Activator.java -> only Activator.java is compiled via delegate!
         writeJava(srcDir, "org/example/Activator.java", """
@@ -605,16 +608,14 @@ class IncrementalCompilationEngineTest {
                     private String internalMsg() { return "started-v2"; }
                 }
                 """);
-        assertThat(delegatingCompiler.performCompile(tychoCfg).isSuccess()).isTrue();
-        assertThat(delegatingCompiler.getLastReport().compiledSources()).containsExactly(activatorFile);
+        assertThat(resolvedCompiler.performCompile(tychoCfg).isSuccess()).isTrue();
+        assertThat(tychoMojo.lastCompiledSubset).containsExactly(activatorFile);
 
         // Modifying META-INF/MANIFEST.MF invalidates optionsFingerprint and triggers full bundle rebuild
         Files.writeString(manifestFile,
                 "Manifest-Version: 1.0\nBundle-SymbolicName: org.example.bundle\nExport-Package: org.example\n");
-        assertThat(delegatingCompiler.performCompile(tychoCfg).isSuccess()).isTrue();
-        assertThat(delegatingCompiler.getLastReport().fullRebuild()).isTrue();
-        assertThat(delegatingCompiler.getLastReport().compiledSources())
-                .containsExactlyInAnyOrder(activatorFile, serviceFile);
+        assertThat(resolvedCompiler.performCompile(tychoCfg).isSuccess()).isTrue();
+        assertThat(tychoMojo.lastCompiledSubset).containsExactlyInAnyOrder(activatorFile, serviceFile);
     }
 
     @Test
@@ -656,8 +657,8 @@ class IncrementalCompilationEngineTest {
         CompilerConfiguration implCfg = createConfig(implSrc, implOut, List.of(concreteFile));
         implCfg.setClasspathEntries(List.of(apiOut.toString()));
 
-        assertThat(engine.compile(apiCfg, backend).compilerResult().isSuccess()).isTrue();
-        assertThat(engine.compile(implCfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, apiCfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, implCfg, backend).compilerResult().isSuccess()).isTrue();
 
         // Add a new unimplemented abstract method m2() to InterfaceA in module-api
         writeJava(apiSrc, "com/api/InterfaceA.java", """
@@ -669,11 +670,11 @@ class IncrementalCompilationEngineTest {
                 """);
 
         // module-api compiles cleanly because AbstractB is abstract
-        assertThat(engine.compile(apiCfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, apiCfg, backend).compilerResult().isSuccess()).isTrue();
 
         // module-impl MUST detect that ConcreteC's transitive supertype InterfaceA changed its ABI
         // and recompile ConcreteC.java (which now fails to compile because m2() is not implemented!)
-        var implRebuild = engine.compile(implCfg, backend);
+        var implRebuild = runCompile(engine, implCfg, backend);
         assertThat(implRebuild.compilerResult().isSuccess()).isFalse();
         assertThat(implRebuild.compiledSources()).containsExactly(concreteFile);
     }
@@ -711,7 +712,7 @@ class IncrementalCompilationEngineTest {
                 """);
 
         CompilerConfiguration cfg1 = createConfig(srcDir, outDir, List.of(pkg2Helper, pkg1Client, pkg1NoWildcard));
-        assertThat(engine.compile(cfg1, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, cfg1, backend).compilerResult().isSuccess()).isTrue();
         assertThat(invokeDescribe(outDir, "com.pkg1.Client")).isEqualTo("from-pkg2");
 
         // Now add a brand-new class com.pkg1.Helper in com.pkg1!
@@ -725,7 +726,7 @@ class IncrementalCompilationEngineTest {
 
         CompilerConfiguration cfg2 = createConfig(
                 srcDir, outDir, List.of(pkg2Helper, pkg1Client, pkg1NoWildcard, pkg1Helper));
-        var r2 = engine.compile(cfg2, backend);
+        var r2 = runCompile(engine, cfg2, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         // Round 1 compiled the new pkg1Helper; Round 2 automatically recompiled pkg1Client (which uses wildcard imports in pkg1),
         // while leaving pkg1NoWildcard and pkg2Helper untouched!
@@ -758,7 +759,7 @@ class IncrementalCompilationEngineTest {
                 """);
 
         CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(containerFile, consumerFile));
-        assertThat(engine.compile(cfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, cfg, backend).compilerResult().isSuccess()).isTrue();
         assertThat(outDir.resolve("com/example/SecondarySupport.class")).exists();
 
         // Remove SecondarySupport from Container.java -> SecondarySupport.class is deleted and Consumer fails to compile!
@@ -767,7 +768,7 @@ class IncrementalCompilationEngineTest {
                 public class Container {}
                 """);
 
-        var r2 = engine.compile(cfg, backend);
+        var r2 = runCompile(engine, cfg, backend);
         assertThat(r2.compilerResult().isSuccess()).isFalse();
         assertThat(outDir.resolve("com/example/SecondarySupport.class")).doesNotExist();
         assertThat(r2.compiledSources()).containsExactlyInAnyOrder(containerFile, consumerFile);
@@ -796,12 +797,12 @@ class IncrementalCompilationEngineTest {
                 """);
 
         CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(pkgInfoFile, serviceFile));
-        var r1 = engine.compile(cfg, backend);
+        var r1 = runCompile(engine, cfg, backend);
         assertThat(r1.compilerResult().isSuccess()).isTrue();
         assertThat(r1.compiledSources()).containsExactlyInAnyOrder(pkgInfoFile, serviceFile);
 
         // Second run must be a true No-Op (0 files compiled) even though package-info.class does not exist on disk!
-        var r2 = engine.compile(cfg, backend);
+        var r2 = runCompile(engine, cfg, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         assertThat(r2.compiledSources()).isEmpty();
     }
@@ -841,7 +842,7 @@ class IncrementalCompilationEngineTest {
 
         CompilerConfiguration cfg1 = createConfig(
                 srcDir, outDir, List.of(shapeFile, circleFile, squareFile, evalFile));
-        assertThat(engine.compile(cfg1, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(runCompile(engine, cfg1, backend).compilerResult().isSuccess()).isTrue();
 
         // Add a new permitted subclass Triangle to sealed interface Shape
         Path triangleFile = writeJava(srcDir, "com/example/Triangle.java", """
@@ -855,10 +856,162 @@ class IncrementalCompilationEngineTest {
 
         CompilerConfiguration cfg2 = createConfig(
                 srcDir, outDir, List.of(shapeFile, circleFile, squareFile, triangleFile, evalFile));
-        var r2 = engine.compile(cfg2, backend);
+        var r2 = runCompile(engine, cfg2, backend);
         assertThat(r2.compilerResult().isSuccess()).isTrue();
         // Shape's PermittedSubclasses changed its hierarchyHash & abiHash, so subtypes and ShapeEvaluator are recompiled!
         assertThat(r2.compiledSources()).contains(shapeFile, triangleFile, evalFile);
+    }
+
+    @Test
+    void scenario15_aggregatingAnnotationProcessorRemovesDeletedClassFromGeneratedResourceList() throws Exception {
+        ReactorAbiCache cache = new ReactorAbiCache();
+        IncrementalCompilationEngine engine = new IncrementalCompilationEngine(cache);
+        JavacBackendCompiler backend = new JavacBackendCompiler();
+
+        Path moduleDir = tempDir.resolve("quarkus-aggregating-apt");
+        Path srcDir = moduleDir.resolve("src/main/java");
+        Path outDir = moduleDir.resolve("target/classes");
+
+        Path annFile = writeJava(srcDir, "com/example/BuildStep.java", """
+                package com.example;
+                import java.lang.annotation.Retention;
+                import java.lang.annotation.RetentionPolicy;
+                @Retention(RetentionPolicy.RUNTIME)
+                public @interface BuildStep {}
+                """);
+        Path stepA = writeJava(srcDir, "com/example/StepA.java", """
+                package com.example;
+                @BuildStep
+                public class StepA {}
+                """);
+        Path stepB = writeJava(srcDir, "com/example/StepB.java", """
+                package com.example;
+                @BuildStep
+                public class StepB {}
+                """);
+
+        CompilerConfiguration cfg1 = createConfig(srcDir, outDir, List.of(annFile, stepA, stepB));
+        cfg1.setAnnotationProcessors(new String[] { TestQuarkusBuildStepProcessor.class.getName() });
+
+        // 1. Initial build writes META-INF/quarkus-build-steps.list with both StepA and StepB
+        var r1 = runCompile(engine, cfg1, backend);
+        assertThat(r1.compilerResult().isSuccess()).isTrue();
+        Path stepsList = outDir.resolve("META-INF/quarkus-build-steps.list");
+        assertThat(stepsList).exists();
+        assertThat(Files.readAllLines(stepsList))
+                .containsExactly("com.example.StepA", "com.example.StepB");
+
+        // 2. Immediate No-Op build -> 0 files compiled even with aggregating APT!
+        var r2 = runCompile(engine, cfg1, backend);
+        assertThat(r2.compilerResult().isSuccess()).isTrue();
+        assertThat(r2.fullRebuild()).isFalse();
+        assertThat(r2.compiledSources()).isEmpty();
+
+        // 3. Delete StepB.java -> engine detects aggregating APT + deletion, runs full processor pass,
+        // and removes stale com.example.StepB from META-INF/quarkus-build-steps.list!
+        Files.delete(stepB);
+        CompilerConfiguration cfg3 = createConfig(srcDir, outDir, List.of(annFile, stepA));
+        cfg3.setAnnotationProcessors(new String[] { TestQuarkusBuildStepProcessor.class.getName() });
+
+        var r3 = runCompile(engine, cfg3, backend);
+        assertThat(r3.compilerResult().isSuccess()).isTrue();
+        assertThat(r3.fullRebuild()).isTrue();
+        assertThat(outDir.resolve("com/example/StepB.class")).doesNotExist();
+        assertThat(Files.readAllLines(stepsList)).containsExactly("com.example.StepA");
+    }
+
+    @Test
+    void scenario16_externallyOverwrittenClassFileDetectedEvenWhenSourceRevertedToOriginalContent() throws Exception {
+        ReactorAbiCache cache = new ReactorAbiCache();
+        IncrementalCompilationEngine engine = new IncrementalCompilationEngine(cache);
+        JavacBackendCompiler backend = new JavacBackendCompiler();
+
+        Path moduleDir = tempDir.resolve("ecj-stub-tamper");
+        Path srcDir = moduleDir.resolve("src/main/java");
+        Path outDir = moduleDir.resolve("target/classes");
+
+        String validSource = """
+                package com.example;
+                public class Greeter {
+                    public String describe() { return "valid-maven-class"; }
+                }
+                """;
+        Path greeterFile = writeJava(srcDir, "com/example/Greeter.java", validSource);
+        CompilerConfiguration cfg = createConfig(srcDir, outDir, List.of(greeterFile));
+
+        // 1. Initial Maven build produces valid Greeter.class
+        assertThat(runCompile(engine, cfg, backend).compilerResult().isSuccess()).isTrue();
+        assertThat(invokeDescribe(outDir, "com.example.Greeter")).isEqualTo("valid-maven-class");
+
+        // 2. Simulate Eclipse/m2e ECJ overwriting Greeter.class with an error-stub class,
+        // while Greeter.java is reverted externally back to its exact original v1 content (newer mtime)!
+        Path greeterClass = outDir.resolve("com/example/Greeter.class");
+        Files.write(greeterClass, new byte[] { (byte) 0xCA, (byte) 0xFE, (byte) 0xBA, (byte) 0xBE, 0, 0, 0, 61 });
+        Files.setLastModifiedTime(greeterClass, FileTime.from(Instant.now().plusSeconds(5)));
+        Files.writeString(greeterFile, validSource, StandardCharsets.UTF_8);
+        Files.setLastModifiedTime(greeterFile, FileTime.from(Instant.now().plusSeconds(10)));
+
+        // 3. Next Maven incremental build MUST detect the tampered Greeter.class and recompile Greeter.java!
+        var r2 = runCompile(engine, cfg, backend);
+        assertThat(r2.compilerResult().isSuccess()).isTrue();
+        assertThat(r2.compiledSources()).containsExactly(greeterFile);
+        assertThat(invokeDescribe(outDir, "com.example.Greeter")).isEqualTo("valid-maven-class");
+    }
+
+    @Test
+    void scenario17_extensionClassesHaveZeroStaticPlexusCompilerImportsForCoreExtensionRealm() throws Exception {
+        ClassFileAnalyzer analyzer = new ClassFileAnalyzer();
+        Path classesDir = Path.of("target/classes");
+
+        List<Path> coreExtensionClasses = List.of(
+                classesDir.resolve("eu/munier/maven/incremental/plugin/IncrementalCompileExecutionListener.class"),
+                classesDir.resolve("eu/munier/maven/incremental/plugin/CrossRealmCompilerBridge.class"),
+                classesDir.resolve("eu/munier/maven/incremental/engine/IncrementalCompilationEngine.class"),
+                classesDir.resolve("eu/munier/maven/incremental/engine/JavacBackendCompiler.class"),
+                classesDir.resolve("eu/munier/maven/incremental/engine/PlexusDelegatingBackendCompiler.class"));
+
+        for (Path clsFile : coreExtensionClasses) {
+            assertThat(clsFile).exists();
+            ClassFileSummary summary = analyzer.analyze(clsFile);
+            for (String ref : summary.getReferencedClassNames()) {
+                assertThat(ref)
+                        .as("Core extension class %s must not statically reference plexus-compiler class %s",
+                                clsFile.getFileName(), ref)
+                        .doesNotStartWith("org.codehaus.plexus.compiler.");
+            }
+        }
+    }
+
+    @SupportedAnnotationTypes("com.example.BuildStep")
+    @SupportedSourceVersion(SourceVersion.RELEASE_17)
+    public static class TestQuarkusBuildStepProcessor extends AbstractProcessor {
+        private final Set<String> discoveredSteps = new TreeSet<>();
+
+        @Override
+        public boolean process(Set<? extends TypeElement> annotations, RoundEnvironment roundEnv) {
+            for (TypeElement ann : annotations) {
+                for (Element el : roundEnv.getElementsAnnotatedWith(ann)) {
+                    if (el instanceof TypeElement te) {
+                        discoveredSteps.add(te.getQualifiedName().toString());
+                    }
+                }
+            }
+            if (roundEnv.processingOver() && !discoveredSteps.isEmpty()) {
+                try {
+                    FileObject resource = processingEnv.getFiler().createResource(
+                            StandardLocation.CLASS_OUTPUT, "", "META-INF/quarkus-build-steps.list");
+                    try (Writer w = resource.openWriter()) {
+                        for (String step : discoveredSteps) {
+                            w.write(step);
+                            w.write('\n');
+                        }
+                    }
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+            return true;
+        }
     }
 
     @SupportedAnnotationTypes("com.example.GenerateBuilder")
@@ -905,6 +1058,7 @@ class IncrementalCompilationEngineTest {
     private static class DummyTychoMojo extends AbstractMojo {
         String compilerId = "jdt";
         boolean useIncrementalCompilation = true;
+        Set<Path> lastCompiledSubset = new LinkedHashSet<>();
         CompilerManager compilerManager = id -> new org.codehaus.plexus.compiler.AbstractCompiler(
                 org.codehaus.plexus.compiler.CompilerOutputStyle.ONE_OUTPUT_FILE_PER_INPUT_FILE,
                 ".java",
@@ -922,9 +1076,14 @@ class IncrementalCompilationEngineTest {
                 for (File f : config.getSourceFiles()) {
                     sources.add(f.toPath().toAbsolutePath().normalize());
                 }
-                var res = new JavacBackendCompiler().compileSubset(
-                        config, sources, Path.of(config.getOutputLocation()));
-                return new CompilerResult(res.success(), res.messages());
+                lastCompiledSubset = new LinkedHashSet<>(sources);
+                try {
+                    var res = new JavacBackendCompiler().compileSubset(
+                            toRequest(config), sources, Path.of(config.getOutputLocation()));
+                    return new CompilerResult(res.success(), List.of());
+                } catch (IncrementalCompilationException e) {
+                    throw new org.codehaus.plexus.compiler.CompilerException(e.getMessage(), e);
+                }
             }
 
             @Override
@@ -936,6 +1095,39 @@ class IncrementalCompilationEngineTest {
         @Override
         public void execute() {
         }
+    }
+
+    private static IncrementalCompilationEngine.CompilationExecutionReport runCompile(
+            IncrementalCompilationEngine engine,
+            CompilerConfiguration cfg,
+            BackendCompiler backend) throws IncrementalCompilationException {
+        return engine.compile(toRequest(cfg), backend);
+    }
+
+    private static CompileRequest toRequest(CompilerConfiguration cfg) {
+        return CompileRequest.builder()
+                .outputLocation(cfg.getOutputLocation())
+                .sourceFiles(cfg.getSourceFiles())
+                .sourceLocations(cfg.getSourceLocations())
+                .classpathEntries(cfg.getClasspathEntries())
+                .modulepathEntries(cfg.getModulepathEntries())
+                .releaseVersion(cfg.getReleaseVersion())
+                .sourceVersion(cfg.getSourceVersion())
+                .targetVersion(cfg.getTargetVersion())
+                .sourceEncoding(cfg.getSourceEncoding())
+                .parameters(cfg.isParameters())
+                .debug(cfg.isDebug())
+                .debugLevel(cfg.getDebugLevel())
+                .showDeprecation(cfg.isShowDeprecation())
+                .showWarnings(cfg.isShowWarnings())
+                .proc(cfg.getProc())
+                .generatedSourcesDirectory(cfg.getGeneratedSourcesDirectory())
+                .processorPathEntries(cfg.getProcessorPathEntries())
+                .annotationProcessors(cfg.getAnnotationProcessors())
+                .customCompilerArgumentsEntries(cfg.getCustomCompilerArgumentsEntries() != null
+                        ? new ArrayList<>(cfg.getCustomCompilerArgumentsEntries())
+                        : List.of())
+                .build();
     }
 
     private static Path writeJava(Path srcRoot, String relativePath, String content) throws IOException {

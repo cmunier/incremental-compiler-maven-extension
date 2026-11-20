@@ -20,6 +20,9 @@ import javax.tools.StandardLocation;
  *   <li>Input {@code .java} source files and generated {@code .class} files (including inner/anonymous classes)</li>
  *   <li>Originating {@code .java} source files and JSR-269 Annotation Processor generated {@code .java} files</li>
  *   <li>Generated {@code .java} files and their compiled {@code .class} outputs</li>
+ *   <li>Aggregating APT outputs: non-{@code .java}/non-{@code .class} resources (e.g.
+ *       {@code META-INF/quarkus-build-steps.list}, {@code META-INF/services/*}) and unattributed
+ *       ({@code sibling == null}) APT outputs</li>
  * </ul>
  */
 public final class TrackingJavaFileManager extends ForwardingJavaFileManager<StandardJavaFileManager> {
@@ -29,6 +32,8 @@ public final class TrackingJavaFileManager extends ForwardingJavaFileManager<Sta
     private final Map<Path, Path> aptSourceToOriginatingSource = new LinkedHashMap<>();
     private final Set<Path> allGeneratedClassFiles = new LinkedHashSet<>();
     private final Set<Path> allAptGeneratedSourceFiles = new LinkedHashSet<>();
+    private final Set<Path> aptGeneratedResourceFiles = new LinkedHashSet<>();
+    private boolean aggregatingAptDetected;
 
     public TrackingJavaFileManager(StandardJavaFileManager fileManager) {
         super(fileManager);
@@ -56,6 +61,14 @@ public final class TrackingJavaFileManager extends ForwardingJavaFileManager<Sta
             recordOutput(location, JavaFileObject.Kind.SOURCE, out, sibling);
         } else if (relativeName != null && relativeName.endsWith(".class")) {
             recordOutput(location, JavaFileObject.Kind.CLASS, out, sibling);
+        } else {
+            // Non-.java / non-.class resource written by an annotation processor
+            // (e.g. META-INF/quarkus-build-steps.list, META-INF/services/*).
+            Path outputPath = toPath(out);
+            if (outputPath != null) {
+                aptGeneratedResourceFiles.add(outputPath);
+                aggregatingAptDetected = true;
+            }
         }
         return out;
     }
@@ -91,6 +104,10 @@ public final class TrackingJavaFileManager extends ForwardingJavaFileManager<Sta
                         .computeIfAbsent(rootSource, k -> new LinkedHashSet<>())
                         .add(outputPath);
                 aptSourceToOriginatingSource.put(outputPath, rootSource);
+            } else {
+                // APT-generated .java source with no single originating element (aggregating processor)
+                aptGeneratedResourceFiles.add(outputPath);
+                aggregatingAptDetected = true;
             }
         }
     }
@@ -127,6 +144,14 @@ public final class TrackingJavaFileManager extends ForwardingJavaFileManager<Sta
 
     public Set<Path> getAllAptGeneratedSourceFiles() {
         return Collections.unmodifiableSet(allAptGeneratedSourceFiles);
+    }
+
+    public Set<Path> getAptGeneratedResourceFiles() {
+        return Collections.unmodifiableSet(aptGeneratedResourceFiles);
+    }
+
+    public boolean isAggregatingAptDetected() {
+        return aggregatingAptDetected;
     }
 
     private static Path toPath(FileObject fileObject) {
